@@ -126,7 +126,7 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
   
   打包细节都在 `nix/package.nix`：NixOS 缺少的库搜索路径、EGL 平台、Vulkan ICD 路径等都在构建期补齐，不改动上游的任何文件。
   
-  NixOS 上除此之外还多加了一个 `libqq-stable-audio.so`（源码 `nix/stable-audio.c`），用 `LD_PRELOAD` 注入 QQ：蓝牙耳机连着时点「屏幕共享」，BlueZ 会把耳机从 A2DP 切到 HFP（要开麦克风），默认音频设备跟着变，QQ 会在自己的设备变更回调里 SIGTRAP 整个进程被杀；这个库把 server/sink/source/card 这几类「设备变了」的 PulseAudio 事件对它隐藏，并把播放流从会随 profile 改名的 `bluez_output.*` 改成跟随系统默认输出。临时关掉：`QQ_WAYLAND_FIX_STABLE_AUDIO=0`。代价是 QQ 运行期间它自己的音频设置界面不再刷新设备列表（重启 QQ 即恢复）。
+  NixOS 上除此之外还多加了一个 `libqq-stable-audio.so`（源码 `nix/stable-audio.c`），用 `LD_PRELOAD` 注入 QQ：蓝牙耳机连着时点「屏幕共享」，BlueZ 会把耳机从 A2DP 切到 HFP（要开麦克风），默认音频设备跟着变，QQ 会在自己的设备变更回调里 SIGTRAP 整个进程被杀。这个库让 QQ 看不到「默认设备变了」：丢掉 server/sink/source/card 这类订阅事件、把 `pa_context_get_server_info` 报的默认设备名冻结成进程启动时的那个（QQ 是轮询这个接口发现变化的）、并把播放/录音流里会随 profile 改名的 `bluez_output.*`/`bluez_input.*` 改成跟随系统默认设备。进进程后会在日志里写一行 `[qq-stable-audio pid=…] loaded: …`，用它确认库真的生效了。临时关掉：`QQ_WAYLAND_FIX_STABLE_AUDIO=0`。代价是 QQ 运行期间它自己的音频设置界面不再刷新设备列表（重启 QQ 即恢复）。
   
 
 ## 使用方法
