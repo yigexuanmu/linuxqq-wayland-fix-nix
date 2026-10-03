@@ -124,7 +124,7 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
   nix develop   # 进开发环境后直接 make
   ```
   
-  打包细节都在 `nix/package.nix`：NixOS 缺少的库搜索路径、EGL 平台、Vulkan ICD 路径等都在构建期补齐，不改动上游的任何文件。
+  打包细节都在 `nix/package.nix`：NixOS 缺少的库搜索路径、EGL 平台、Vulkan ICD 路径，以及 KDE 下开始共享必崩的规避开关（给 QQ 追加 `--disable-features=WaylandLinuxDrmSyncobj`，避免边框隐藏与 KWin 的 explicit sync 冲突）都在这里补齐，不改动上游的任何文件。
   
 
 ## 使用方法

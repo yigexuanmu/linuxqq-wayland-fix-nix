@@ -168,6 +168,21 @@ stdenv.mkDerivation (finalAttrs: {
     #    r600 …），所以补上它之后，AMD/Intel 的硬件编解码与 NVIDIA 的 nvidia-vaapi-driver
     #    都能直接用。
     #
+    # 共享不再闪退（KDE Plasma 6.7 等启用 explicit sync 的合成器）：
+    #
+    # 上游的 libqq-borderfix.so 隐藏「屏幕共享」边框窗口，靠的是在协议层把该 surface 的
+    # wl_surface.attach(buffer) 改写成 attach(NULL)。但客户端一旦用 linux-drm-syncobj-v1
+    # 的 explicit sync，KWin 会拒绝「带同步点、却没有 buffer」的提交：
+    #   libwayland: wp_linux_drm_syncobj_surface_v1#NN: error 3: explicit sync is used, but no buffer is attached
+    # libwayland 客户端把协议错误交给 Chromium，后者直接 trap 掉整个进程（signal 5 SIGTRAP，
+    # 与边框被隐藏只差几十微秒；崩溃栈全在 qq 里的 int3/ud2 陷阱）。niri 不上报这个协议，
+    # 所以上游没碰到；KDE 下则是点「确定」开始共享必崩。
+    #
+    # 关掉客户端的 explicit sync，Chromium 回退到隐式同步（等同 niri 时代那条路径），
+    # 协议错误不再出现，边框隐藏、共享、截图照常。
+    # 用 --append-flags 追加到用户参数之后：--doctor / --version / --help 的判断不受影响，
+    # 用户自己传 --disable-features=... 时也以用户参数为准。
+    #
     # PATH：补上启动器与 --doctor 依赖的小工具。
     # QQ_WAYLAND_FIX_QQ：指向 pkgs.qq 的启动脚本（它会自己处理 libssh2 预加载、
     #   gsettings / GIO 模块、NIXOS_OZONE_WL 等 NixOS 上必需的运行环境）。
@@ -178,6 +193,7 @@ stdenv.mkDerivation (finalAttrs: {
       --suffix LD_LIBRARY_PATH : /run/opengl-driver/lib \
       --run 'if [ -z "''${EGL_PLATFORM:-}" ] && [ -n "''${WAYLAND_DISPLAY:-}" ]; then export EGL_PLATFORM=wayland; fi' \
       --run 'if [ -z "''${VK_DRIVER_FILES:-}''${VK_ICD_FILENAMES:-}" ] && [ -d /run/opengl-driver/share/vulkan/icd.d ]; then icds=$(ls /run/opengl-driver/share/vulkan/icd.d/*.json 2>/dev/null | tr "\n" ":"); [ -n "$icds" ] && export VK_DRIVER_FILES="''${icds%:}"; fi' \
+      --append-flags '--disable-features=WaylandLinuxDrmSyncobj' \
       ${lib.optionalString (qqPackage != null) ''
         --set QQ_WAYLAND_FIX_QQ ${lib.getExe' qqPackage "qq"} \
         --set QQ_WAYLAND_FIX_QQ_ROOT "${qqPackage}/opt/QQ"
