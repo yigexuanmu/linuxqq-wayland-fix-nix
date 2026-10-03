@@ -11,6 +11,11 @@
  * 所以本库退到 socket 层：拦 libc 的 sendmsg，解析出站的 Wayland 线协议，
  * 把这条 surface 的 wl_surface.attach(buffer) 原地改写成 attach(NULL)，
  * 让它永远不映射；其它窗口一律不碰。
+ * 注意（KWin 的 explicit sync）：KWin 6.x 上 Chromium 会走
+ * wp_linux_drm_syncobj_v1，同一个 commit 里还给 surface 设 acquire/release
+ * point；只摘 buffer 会让 KWin 报「explicit sync is used, but no buffer is
+ * attached」协议错误并断开连接（QQ 随之崩溃）。这两条消息也会被原地改写成
+ * 同长度的 attach(NULL)（见 IF_SYNCOBJ_SURFACE）。
  *
  * ── 问题 2：截图覆盖层在平铺合成器里被当普通窗口 ──
  * 截图窗口是 Electron 的 Wayland toplevel（app_id "QQ"、标题为空、尺寸为
@@ -35,6 +40,9 @@
  * - 边框判定：标题 ==「屏幕共享」，min < 600 且 max > 10000（不设限）；
  *   同标题但 min == max 的固定小窗（共享预览、87x40 工具条）排除；
  * - 覆盖层判定：app_id == "QQ"，标题为空，window_geometry ≥ 600x400；
+ * - explicit sync：解析 wp_linux_drm_syncobj_manager_v1.get_surface 建立
+ *   syncobj surface ↔ wl_surface 映射；被隐藏 surface 的 set_acquire_point /
+ *   set_release_point 原地改写成 attach(NULL)（同为 20 字节）；
  * - 隐藏是原地改写 attach 的 buffer id；全屏是在消息边界上补发一条完整消息。
  *
  * ── 维护注意（踩过的坑）──
@@ -87,6 +95,8 @@ enum wl_iface {
     IF_XDG_WM_BASE,
     IF_XDG_SURFACE,
     IF_XDG_TOPLEVEL,
+    IF_SYNCOBJ_MANAGER, /* wp_linux_drm_syncobj_manager_v1 */
+    IF_SYNCOBJ_SURFACE, /* wp_linux_drm_syncobj_surface_v1 */
 };
 
 struct wl_object_state {
@@ -211,6 +221,9 @@ static int iface_from_name(const uint8_t *name, size_t len)
         return IF_COMPOSITOR;
     if (len == sizeof("xdg_wm_base") && !memcmp(name, "xdg_wm_base", len))
         return IF_XDG_WM_BASE;
+    if (len == sizeof("wp_linux_drm_syncobj_manager_v1") &&
+        !memcmp(name, "wp_linux_drm_syncobj_manager_v1", len))
+        return IF_SYNCOBJ_MANAGER;
     return IF_NONE;
 }
 
@@ -363,7 +376,7 @@ static void flush_injection(int conn)
 
 /* ---------------- Wayland 线协议 ---------------- */
 
-static void handle_wire_request(int conn, uint32_t id, uint32_t opcode,
+static void handle_wire_request(int conn, uint8_t *msg, uint32_t id, uint32_t opcode,
                                 uint8_t *args, size_t len)
 {
     if (id == 1) { /* wl_display：get_registry */
@@ -480,6 +493,37 @@ static void handle_wire_request(int conn, uint32_t id, uint32_t opcode,
             object_forget(conn, id);
         }
         break;
+    case IF_SYNCOBJ_MANAGER:
+        if (opcode == 1 && len >= 8) { /* get_surface(new_id, wl_surface) */
+            struct wl_object_state *n = object_state(conn, get_u32(args), 1);
+            if (n) {
+                n->iface = IF_SYNCOBJ_SURFACE;
+                n->surface = get_u32(args + 4);
+            }
+        }
+        break;
+    case IF_SYNCOBJ_SURFACE:
+        if ((opcode == 1 || opcode == 2) && len == 12) {
+            /* set_acquire_point / set_release_point（12 字节载荷，共 20 字节）。
+             * 对应 wl_surface 的 buffer 已被我们摘掉（共享边框）时，保留显式同步点
+             * 会让 KWin 在 commit 时报「explicit sync is used, but no buffer is
+             * attached」协议错误并断开连接，QQ 随之崩溃。把这条消息原地改写成
+             * 同一 surface 的 attach(NULL,0,0)（同样 20 字节）：不产生同步状态，
+             * 也不改变消息边界。 */
+            struct wl_object_state *surf = object_state(conn, o->surface, 0);
+            if (surf && (surf->border || surf->hide)) {
+                put_u32(msg, o->surface);
+                put_u32(msg + 4, (uint32_t)((20u << 16) | 1u)); /* wl_surface.attach */
+                put_u32(args, 0);
+                put_u32(args + 4, 0);
+                put_u32(args + 8, 0);
+                if (debug)
+                    LOG("neutralized explicit-sync point on hidden surface %u", o->surface);
+            }
+        } else if (opcode == 0) { /* destroy */
+            object_forget(conn, id);
+        }
+        break;
     case IF_SURFACE:
         if (opcode == 1 && (o->border || o->hide)) { /* attach(buffer, x, y) -> attach(NULL) */
             if (len >= 12 && get_u32(args) != 0)
@@ -502,7 +546,7 @@ static void rewrite_chunk(int conn, uint8_t *buf, size_t len)
         uint32_t opcode = word & 0xffff;
         if (size < 8 || (size & 3) || size > len - off)
             break;
-        handle_wire_request(conn, id, opcode, buf + off + 8, size - 8);
+        handle_wire_request(conn, buf + off, id, opcode, buf + off + 8, size - 8);
         off += size;
     }
 }

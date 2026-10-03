@@ -2,8 +2,8 @@
 *.so
 build/
 /linuxqq-wayland-fix
-/qq-kwin-screenshot-helper
-/qq-kwin-screenshot-helper.desktop
+/qq-screenshot-helper
+/qq-screenshot-helper.desktop
 /dist/
 /packaging/arch/src/
 /packaging/arch/pkg/

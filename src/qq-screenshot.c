@@ -11,15 +11,19 @@
  *   1. 在 Wayland 会话里（有 WAYLAND_DISPLAY），通过 wlr-screencopy 逐个截取 Wayland 输出，
  *      按 X 的显示器布局（XRandR monitors，名字与 wl_output 名字对应）拼成根窗口坐标系下的画面。
  *      XShmGetImage 在 rootless XWayland 上不报错、只给全黑，所以不能「X 失败了再截」；
- *   2. KDE（KWin）没有 wlr-screencopy：fork/exec 安装的 qq-kwin-screenshot-helper，
+ *   2. KDE（KWin）没有 wlr-screencopy：fork/exec qq-screenshot-helper（kde 模式），
  *      由它调 org.kde.KWin.ScreenShot2.CaptureWorkspace（helper 自己的 .desktop
  *      声明了受限接口，能通过 KWin 的权限检查），原始像素经管道传回后按显示器裁剪；
- *   3. 其它情况（GNOME 等）照常调用 Xlib，但临时接管 X 错误（默认处理会直接退出进程）；
+ *   3. GNOME 没有 wlr-screencopy 也没有 KWin：走 portal（helper 的 portal 模式调
+ *      org.freedesktop.portal.Screenshot，interactive=false），helper 解码 PNG 后
+ *      回传原始像素；GNOME 会弹它自己的截图对话框等用户确认；
+ *   4. 其它情况照常调用 Xlib，但临时接管 X 错误（默认处理会直接退出进程）；
  *      仍然失败就给一张黑图，至少不闪退。真正的 X11 会话里截取会成功，行为不变。
  *
  * QQ_SCREENSHOT_FIX_DISABLE=1 关掉整个截图修复；
  * QQ_SCREENSHOT_KDE=0 只关 KDE 路径，=1 强制走 KDE（测试用）；
- * QQ_SCREENSHOT_KDE_HELPER 覆盖 helper 路径（测试用）。
+ * QQ_SCREENSHOT_PORTAL=1/0 强制开/关 portal 路径（默认仅 GNOME 会话启用）；
+ * QQ_SCREENSHOT_HELPER 覆盖 helper 路径（测试用）。
  */
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
@@ -45,9 +49,9 @@
 
 #define LOG(...) do { fprintf(stderr, "[qq-screenshot] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
-/* KDE 截图 helper 的默认安装路径（make 按 LIBEXECDIR 覆盖）。 */
-#ifndef QQ_KDE_HELPER
-#define QQ_KDE_HELPER "/usr/lib/linuxqq-wayland-fix/qq-kwin-screenshot-helper"
+/* 截图 helper 的默认安装路径（make 按 LIBEXECDIR 覆盖）。 */
+#ifndef QQ_SCREENSHOT_HELPER
+#define QQ_SCREENSHOT_HELPER "/usr/lib/linuxqq-wayland-fix/qq-screenshot-helper"
 #endif
 
 /* ---------------- 截取 Wayland 输出 ---------------- */
@@ -449,7 +453,7 @@ static int target_monitor(Display *dpy, char *name, size_t name_size,
 
 /* ---------------- KDE（KWin ScreenShot2）---------------- */
 
-struct kwin_shot_header {
+struct shot_header {
     char magic[4]; /* "QQKS" */
     uint32_t width, height, stride, format; /* QImage::Format */
     double scale;
@@ -472,15 +476,33 @@ static int kde_mode(void)
     return mode;
 }
 
-static const char *kde_helper_path(void)
+static const char *screenshot_helper_path(void)
 {
-    const char *p = getenv("QQ_SCREENSHOT_KDE_HELPER");
-    return (p && *p) ? p : QQ_KDE_HELPER;
+    const char *p = getenv("QQ_SCREENSHOT_HELPER");
+    return (p && *p) ? p : QQ_SCREENSHOT_HELPER;
 }
 
 static int kde_usable(void)
 {
-    return kde_mode() == 1 && access(kde_helper_path(), X_OK) == 0;
+    return kde_mode() == 1 && access(screenshot_helper_path(), X_OK) == 0;
+}
+
+/* portal 截图（org.freedesktop.portal.Screenshot）：GNOME 默认启用（KDE 有
+ * ScreenShot2、wlroots 有 wlr-screencopy，都不走这条）；QQ_SCREENSHOT_PORTAL=1/0
+ * 可强制开关（测试用）。 */
+static int portal_enabled(void)
+{
+    static int state = -1;
+    if (state >= 0)
+        return state;
+    const char *v = getenv("QQ_SCREENSHOT_PORTAL");
+    if (v && *v) {
+        state = !strcmp(v, "0") ? 0 : 1;
+        return state;
+    }
+    const char *de = getenv("XDG_CURRENT_DESKTOP");
+    state = (de && strstr(de, "GNOME")) ? 1 : 0;
+    return state;
 }
 
 /* 去掉子进程环境里的注入变量，避免 helper 里再加载一遍我们的库。 */
@@ -517,12 +539,12 @@ static int read_all(int fd, void *buf, size_t len)
 }
 
 /*
- * 调 helper 截整张工作区（KWin ScreenShot2.CaptureWorkspace，原始像素）。
- * 成功返回 0x00RRGGBB 的缓冲，失败返回 NULL（调用方退回黑图）。
+ * 调 helper 截整张工作区（mode = "kde" 走 KWin ScreenShot2，"portal" 走
+ * org.freedesktop.portal.Screenshot）。成功返回 0x00RRGGBB 的缓冲，失败返回 NULL。
  */
-static uint32_t *kde_workspace_image(int *w, int *h)
+static uint32_t *helper_workspace_image(const char *mode, int *w, int *h)
 {
-    const char *helper = kde_helper_path();
+    const char *helper = screenshot_helper_path();
     int fds[2];
     if (pipe(fds) != 0)
         return NULL;
@@ -540,24 +562,24 @@ static uint32_t *kde_workspace_image(int *w, int *h)
             close(fds[1]);
         strip_env("LD_PRELOAD");
         strip_env("LD_LIBRARY_PATH");
-        execl(helper, helper, (char *)NULL);
+        execl(helper, helper, mode, (char *)NULL);
         _exit(127);
     }
     close(fds[1]);
 
-    struct kwin_shot_header hdr;
+    struct shot_header hdr;
     uint8_t *raw = NULL;
     uint32_t *pix = NULL;
     if (read_all(fds[0], &hdr, sizeof hdr) != 0 || memcmp(hdr.magic, "QQKS", 4) != 0 ||
         !hdr.width || !hdr.height || !hdr.stride) {
-        LOG("KDE: ScreenShot2 helper failed (权限未生效或 KWin 版本不支持？)");
+        LOG("%s: screenshot helper failed (KDE 权限或 portal 不可用？)", mode);
         goto out;
     }
 
     size_t total = (size_t)hdr.stride * hdr.height;
     raw = malloc(total);
     if (!raw || read_all(fds[0], raw, total) != 0) {
-        LOG("KDE: short image from helper");
+        LOG("%s: short image from helper", mode);
         goto out;
     }
 
@@ -582,15 +604,15 @@ static uint32_t *kde_workspace_image(int *w, int *h)
         }
         break;
     default:
-        LOG("KDE: unsupported QImage format %u", hdr.format);
+        LOG("%s: unsupported QImage format %u", mode, hdr.format);
         free(pix);
         pix = NULL;
         goto out;
     }
     *w = (int)hdr.width;
     *h = (int)hdr.height;
-    LOG("KDE: captured workspace %ux%u via ScreenShot2 (QImage format %u, scale %.2f)",
-        hdr.width, hdr.height, hdr.format, hdr.scale);
+    LOG("%s: captured workspace %ux%u (QImage format %u, scale %.2f)",
+        mode, hdr.width, hdr.height, hdr.format, hdr.scale);
 
 out:
     free(raw);
@@ -619,13 +641,14 @@ static void blit_rect(uint32_t *dst, int dw, int dh,
 }
 
 /*
- * KDE 单屏：工作区整图按 X 根窗口/显示器矩形的比例裁剪并缩放到请求尺寸。
- * X11 根窗口原点与 KWin 工作区包围盒原点一致，按尺寸比例映射即可。
+ * 单屏：工作区整图（helper 给的原始像素）按 X 根窗口/显示器矩形的比例裁剪并
+ * 缩放到请求尺寸。X11 根窗口原点与工作区包围盒原点一致，按尺寸比例映射即可。
  */
-static uint32_t *kde_monitor_image(Display *dpy, int mx, int my, int mw, int mh, int w, int h)
+static uint32_t *helper_monitor_image(const char *mode, Display *dpy,
+                                      int mx, int my, int mw, int mh, int w, int h)
 {
     int kw = 0, kh = 0;
-    uint32_t *kpix = kde_workspace_image(&kw, &kh);
+    uint32_t *kpix = helper_workspace_image(mode, &kw, &kh);
     if (!kpix)
         return NULL;
 
@@ -643,8 +666,8 @@ static uint32_t *kde_monitor_image(Display *dpy, int mx, int my, int mw, int mh,
         int iy = (int)((long)my * kh / (long)rh);
         int iw = (int)((long)mw * kw / (long)rw);
         int ih = (int)((long)mh * kh / (long)rh);
-        LOG("KDE: crop monitor (%d,%d %dx%d) -> image (%d,%d %dx%d) -> %dx%d",
-            mx, my, mw, mh, ix, iy, iw, ih, w, h);
+        LOG("%s: crop monitor (%d,%d %dx%d) -> image (%d,%d %dx%d) -> %dx%d",
+            mode, mx, my, mw, mh, ix, iy, iw, ih, w, h);
         blit_rect(pix, w, h, kpix, kw, kh, ix, iy, iw, ih);
     }
     free(kpix);
@@ -678,7 +701,7 @@ static uint32_t *monitor_image(Display *dpy, const char *name,
     int kde_first = kde_usable(); /* KDE 会话（或测试强制）时优先 ScreenShot2 */
 
     if (kde_first)
-        pix = kde_monitor_image(dpy, mx, my, mw, mh, w, h);
+        pix = helper_monitor_image("kde", dpy, mx, my, mw, mh, w, h);
 
     if (!pix) {
         struct capture c;
@@ -703,7 +726,10 @@ static uint32_t *monitor_image(Display *dpy, const char *name,
     }
 
     if (!pix && !kde_first && kde_usable())
-        pix = kde_monitor_image(dpy, mx, my, mw, mh, w, h);
+        pix = helper_monitor_image("kde", dpy, mx, my, mw, mh, w, h);
+
+    if (!pix && portal_enabled())
+        pix = helper_monitor_image("portal", dpy, mx, my, mw, mh, w, h);
 
     if (!pix)
         pix = calloc((size_t)w * h, 4); /* 截不到：给全黑，行为与以前一致 */
@@ -772,7 +798,7 @@ static uint32_t *root_image(Display *dpy, Window root, int *w, int *h)
 
     if (!pix && kde_usable()) {
         int kw = 0, kh = 0;
-        uint32_t *kpix = kde_workspace_image(&kw, &kh);
+        uint32_t *kpix = helper_workspace_image("kde", &kw, &kh);
         if (kpix) {
             pix = calloc((size_t)rw * rh, 4);
             if (pix)
@@ -780,6 +806,19 @@ static uint32_t *root_image(Display *dpy, Window root, int *w, int *h)
             free(kpix);
             if (pix)
                 LOG("captured %ux%u root via KDE ScreenShot2", rw, rh);
+        }
+    }
+
+    if (!pix && portal_enabled()) {
+        int kw = 0, kh = 0;
+        uint32_t *kpix = helper_workspace_image("portal", &kw, &kh);
+        if (kpix) {
+            pix = calloc((size_t)rw * rh, 4);
+            if (pix)
+                blit_rect(pix, (int)rw, (int)rh, kpix, kw, kh, 0, 0, kw, kh);
+            free(kpix);
+            if (pix)
+                LOG("captured %ux%u root via portal Screenshot", rw, rh);
         }
     }
 

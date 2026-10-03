@@ -222,17 +222,17 @@ doctor() {
         note "没有 wayland-info，跳过剪贴板协议检查（安装 wayland-utils 可检查）"
     fi
     if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
-        local kde_helper="$LIBDIR/qq-kwin-screenshot-helper" kde_desktop="" d
+        local kde_helper="$LIBDIR/qq-screenshot-helper" kde_desktop="" d
         for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share} /usr/share; do
-            if [[ -r "$d/applications/qq-kwin-screenshot-helper.desktop" ]]; then
-                kde_desktop="$d/applications/qq-kwin-screenshot-helper.desktop"
+            if [[ -r "$d/applications/qq-screenshot-helper.desktop" ]]; then
+                kde_desktop="$d/applications/qq-screenshot-helper.desktop"
                 break
             fi
         done
         if [[ ! -x "$kde_helper" ]]; then
             note "截图：缺 $kde_helper（KDE 下截图会是黑图，重装本包）"
         elif [[ -z "$kde_desktop" ]]; then
-            note "截图：找不到 qq-kwin-screenshot-helper.desktop，KWin 的权限检查会拒绝 ScreenShot2（重装本包）"
+            note "截图：找不到 qq-screenshot-helper.desktop，KWin 的权限检查会拒绝 ScreenShot2（重装本包）"
         elif ! grep -q '^X-KDE-DBUS-Restricted-Interfaces=org\.kde\.KWin\.ScreenShot2$' "$kde_desktop"; then
             note "截图：$kde_desktop 的受限接口声明格式不对（不能带结尾分号），KWin 会拒绝 ScreenShot2"
         elif command -v busctl >/dev/null 2>&1 && ! busctl --user status org.kde.KWin.ScreenShot2 >/dev/null 2>&1; then

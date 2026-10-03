@@ -30,14 +30,14 @@ SS_LIB     := libqq-wl-portal.so
 CB_LIB     := libqq-clipbridge.so
 SH_LIB     := libqq-screenshot.so
 BF_LIB     := libqq-borderfix.so
-KDE_HELPER := qq-kwin-screenshot-helper
-KDE_HELPER_DESKTOP := $(KDE_HELPER).desktop
+SHOT_HELPER := qq-screenshot-helper
+SHOT_HELPER_DESKTOP := $(SHOT_HELPER).desktop
 CMD        := $(NAME)
 CB_PROTOCOLS := ext-data-control-v1 wlr-data-control-unstable-v1
 CB_GEN_H   := $(CB_PROTOCOLS:%=build/%-client-protocol.h)
 CB_GEN_C   := $(CB_PROTOCOLS:%=build/%-protocol.c)
 
-all: $(SS_LIB) $(CB_LIB) $(SH_LIB) $(BF_LIB) $(KDE_HELPER) $(KDE_HELPER_DESKTOP) $(CMD)
+all: $(SS_LIB) $(CB_LIB) $(SH_LIB) $(BF_LIB) $(SHOT_HELPER) $(SHOT_HELPER_DESKTOP) $(CMD)
 
 build/qq-wl-portal.o: src/qq-wl-portal.c
 	@mkdir -p build
@@ -66,14 +66,15 @@ $(CB_LIB): src/qq-clipbridge.c $(CB_GEN_H) $(CB_GEN_C)
 # 截图修复：同样用 X11 与 wayland-client（wlr-screencopy）；KDE 下 fork/exec helper 调 KWin ScreenShot2
 $(SH_LIB): src/qq-screenshot.c build/wlr-screencopy-unstable-v1-client-protocol.h build/wlr-screencopy-unstable-v1-protocol.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -Wall -Wextra -Ibuild $(CB_CFLAGS) \
-	    -DQQ_KDE_HELPER='"$(LIBEXECDIR)/$(KDE_HELPER)"' \
+	    -DQQ_SCREENSHOT_HELPER='"$(LIBEXECDIR)/$(SHOT_HELPER)"' \
 	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ src/qq-screenshot.c build/wlr-screencopy-unstable-v1-protocol.c $(CB_LIBS) -ldl
 
-# KDE 截图 helper：替 QQ 调 KWin ScreenShot2；配套 .desktop 声明受限接口（KWin 按 exe 路径鉴权）
-$(KDE_HELPER): src/qq-kwin-screenshot-helper.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SS_CFLAGS) -o $@ $< $(SS_LIBS)
+# KDE 截图 helper：替 QQ 调 KWin ScreenShot2（kde 模式）或 portal 截图（portal 模式）；
+# 配套 .desktop 声明受限接口（KWin 按 exe 路径鉴权）
+$(SHOT_HELPER): src/qq-screenshot-helper.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra $(SS_CFLAGS) -o $@ $< $(SS_LIBS) -lz
 
-$(KDE_HELPER_DESKTOP): $(KDE_HELPER_DESKTOP).in
+$(SHOT_HELPER_DESKTOP): $(SHOT_HELPER_DESKTOP).in
 	sed -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|g' $< > $@
 
 # 共享边框隐藏：socket 层拦 Wayland 出站流量，把「屏幕共享」全屏边框的 buffer 摘掉
@@ -90,8 +91,8 @@ install: all
 	install -Dm755 $(CB_LIB)         $(DESTDIR)$(LIBEXECDIR)/$(CB_LIB)
 	install -Dm755 $(SH_LIB)         $(DESTDIR)$(LIBEXECDIR)/$(SH_LIB)
 	install -Dm755 $(BF_LIB)         $(DESTDIR)$(LIBEXECDIR)/$(BF_LIB)
-	install -Dm755 $(KDE_HELPER)     $(DESTDIR)$(LIBEXECDIR)/$(KDE_HELPER)
-	install -Dm644 $(KDE_HELPER_DESKTOP) $(DESTDIR)$(DATADIR)/applications/$(KDE_HELPER_DESKTOP)
+	install -Dm755 $(SHOT_HELPER)     $(DESTDIR)$(LIBEXECDIR)/$(SHOT_HELPER)
+	install -Dm644 $(SHOT_HELPER_DESKTOP) $(DESTDIR)$(DATADIR)/applications/$(SHOT_HELPER_DESKTOP)
 	install -Dm755 $(CMD)            $(DESTDIR)$(BINDIR)/$(CMD)
 	install -Dm644 $(CMD).desktop    $(DESTDIR)$(DATADIR)/applications/$(CMD).desktop
 	install -Dm644 README.md         $(DESTDIR)$(DOCDIR)/README.md
@@ -99,7 +100,7 @@ install: all
 	install -Dm644 LICENSE           $(DESTDIR)$(DATADIR)/licenses/$(NAME)/LICENSE
 
 clean:
-	rm -rf build src/*.o $(SS_LIB) $(CB_LIB) $(SH_LIB) $(BF_LIB) $(KDE_HELPER) $(KDE_HELPER_DESKTOP) $(CMD)
+	rm -rf build src/*.o $(SS_LIB) $(CB_LIB) $(SH_LIB) $(BF_LIB) $(SHOT_HELPER) $(SHOT_HELPER_DESKTOP) $(CMD)
 
 print-version:
 	@echo $(VERSION)
