@@ -17,18 +17,17 @@
         "aarch64-linux"
       ];
 
-      # 上游没有 VERSION 文件（Makefile 用 git describe 兜底），这里换成 git revision，
-      # 这样 linuxqq-wayland-fix --doctor 和日志里能看到具体的构建版本。
-      # 同步上游发版时改这一行（对应上游 tag vX.Y.Z）。
-      upstreamVersion = "0.2.10";
-
+      # 上游没有 VERSION 文件：版本只存在于 git tag 里，而 flake 求值看不到 tag
+      # （self.sourceInfo.ref 无论按 tag 还是按分支固定都是 null，self 里也没有 ref）。
+      # 所以版本串只用 git revision，不再手写上游版本号，也就不会再出现
+      # "版本串和代码对不上"（LinuxQQ Wayland Fix v0.2.7-unstable-abc1234 那种）。
       version =
         if self ? shortRev then
-          "${upstreamVersion}-unstable-${self.shortRev}"
+          "unstable-${self.shortRev}"
         else if self ? dirtyShortRev then
-          "${upstreamVersion}-unstable-${self.dirtyShortRev}"
+          "unstable-${self.dirtyShortRev}"
         else
-          upstreamVersion;
+          "unstable";
 
       # nixpkgs 的 pkgs.qq 是 unfree。只有在 nixpkgs 允许 unfree 时才引用它，
       # 否则 packages / overlays 在默认 nixpkgs 上会直接求值报错。
