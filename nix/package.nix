@@ -79,12 +79,21 @@ stdenv.mkDerivation (finalAttrs: {
   buildPhase = ''
     runHook preBuild
     make $makeFlags
+
+    # 额外编一个我们自己的注入库（不在上游 src/ 里，只影响本 flake 打出来的包）：
+    # 让 QQ 收不到「默认设备变了」的事件。详见 nix/stable-audio.c 的文件头。
+    # 只用到 libpulse 的头文件，运行时所有符号都靠 dlsym 拿，所以不链接 libpulse。
+    $CC -shared -fPIC -O2 -Wall -o libqq-stable-audio.so \
+      ${./stable-audio.c} -I${lib.getDev libpulseaudio}/include
+
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     make install $makeFlags
+    install -Dm755 libqq-stable-audio.so \
+      $out/lib/linuxqq-wayland-fix/libqq-stable-audio.so
     runHook postInstall
   '';
 
@@ -174,8 +183,15 @@ stdenv.mkDerivation (finalAttrs: {
     # QQ_WAYLAND_FIX_QQ：指向 pkgs.qq 的启动脚本（它会自己处理 libssh2 预加载、
     #   gsettings / GIO 模块、NIXOS_OZONE_WL 等 NixOS 上必需的运行环境）。
     # QQ_WAYLAND_FIX_QQ_ROOT：上面第 2 个补丁用到的 QQ 安装目录。
+    # libqq-stable-audio.so：让 QQ 眼里的默认音频设备恒定住。
+    #   蓝牙耳机连着点「屏幕共享」时 BlueZ 会切 A2DP→HFP（要开麦克风），默认设备跟着变；
+    #   QQ 在「默认设备变了」的回调里写自己的加密日志，realloc 处 SIGTRAP，整个进程被杀。
+    #   这个库把那类事件对 QQ 藏起来（详见 nix/stable-audio.c）。
+    #   LD_PRELOAD 用 --prefix：上游启动器会把自己那四个库放在前面，两边互不遮蔽。
+    #   临时关掉：QQ_WAYLAND_FIX_STABLE_AUDIO=0。
     wrapProgram $out/bin/linuxqq-wayland-fix \
       --prefix PATH : ${lib.makeBinPath runtimeTools} \
+      --prefix LD_PRELOAD : $out/lib/linuxqq-wayland-fix/libqq-stable-audio.so \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ libva (lib.getLib pipewire) ]} \
       --suffix LD_LIBRARY_PATH : /run/opengl-driver/lib \
       --run 'if [ -z "''${EGL_PLATFORM:-}" ] && [ -n "''${WAYLAND_DISPLAY:-}" ]; then export EGL_PLATFORM=wayland; fi' \
