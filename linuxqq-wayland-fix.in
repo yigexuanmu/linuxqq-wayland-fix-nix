@@ -12,7 +12,9 @@
 #   QQ_WAYLAND_FIX_ANGLE      ANGLE 后端：auto（默认，检测到 Vulkan 时用 vulkan）| vulkan | swiftshader | off
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
 #   QQ_CLIPBOARD_FIX_DISABLE=1 关闭剪贴板修复（排查问题用）
+#   QQ_CLIPBOARD_FIX_FORCE=1   强制启用剪贴板修复（KDE 上默认禁用，仅供测试）
 #   QQ_SCREENSHOT_FIX_DISABLE=1 关闭截图防闪退（排查问题用）
+#   QQ_SCREENSHOT_KDE=0       关闭 KDE 的 KWin ScreenShot2 截图路径（排查问题用）
 #   QQ_BORDER_FIX_DISABLE=1   关闭窗口修补（共享边框隐藏、截图覆盖层标题与全屏；排查问题用）
 
 set -u
@@ -92,6 +94,23 @@ angle_mode() {
     esac
 }
 
+# KDE Plasma 自带 XWayland↔Wayland 剪贴板同步（KWin/Klipper），与我们的桥冲突会让 QQ 崩溃，
+# 所以 KDE 上默认不预加载剪贴板修复；QQ_CLIPBOARD_FIX_FORCE=1 可强制启用。
+clipboard_auto_disabled() {
+    [[ -z "${QQ_CLIPBOARD_FIX_FORCE:-}" ]] || return 1
+    [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* || -n "${KDE_FULL_SESSION:-}" ]]
+}
+
+clipboard_state() {
+    if clipboard_auto_disabled; then
+        echo "off(kde)"
+    elif [[ -n "${QQ_CLIPBOARD_FIX_DISABLE:-}" && "${QQ_CLIPBOARD_FIX_DISABLE}" != 0 ]]; then
+        echo off
+    else
+        echo on
+    fi
+}
+
 # 当前生效的 QQ 版本目录：热更新版本优先，否则用安装目录。
 qq_version_dir() {
     local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/QQ/versions" cur=""
@@ -117,7 +136,13 @@ doctor() {
     local qq; qq=$(find_qq)
     [[ -n "$qq" ]] && pass "QQ 启动方式: $qq" || bad "找不到 QQ（linuxqq 或 /opt/QQ/qq），可用 QQ_WAYLAND_FIX_QQ 指定"
     [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
-    [[ -r "$CLIPBOARD_LIB" ]] && pass "剪贴板修复: $CLIPBOARD_LIB" || bad "找不到 $CLIPBOARD_LIB"
+    if clipboard_auto_disabled; then
+        note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
+    elif [[ -r "$CLIPBOARD_LIB" ]]; then
+        pass "剪贴板修复: $CLIPBOARD_LIB"
+    else
+        bad "找不到 $CLIPBOARD_LIB"
+    fi
     [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
     [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
     [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
@@ -182,7 +207,9 @@ doctor() {
     else
         note "没有 busctl，跳过 portal 检查"
     fi
-    if command -v wayland-info >/dev/null 2>&1; then
+    if clipboard_auto_disabled; then
+        note "剪贴板：KDE Plasma 自带 XWayland 剪贴板同步，本修复已默认禁用（QQ 剪贴板照常可用）"
+    elif command -v wayland-info >/dev/null 2>&1; then
         local wi; wi=$(wayland-info 2>/dev/null)
         if grep -q ext_data_control_manager_v1 <<< "$wi"; then
             pass "剪贴板：合成器支持 ext-data-control"
@@ -193,6 +220,26 @@ doctor() {
         fi
     else
         note "没有 wayland-info，跳过剪贴板协议检查（安装 wayland-utils 可检查）"
+    fi
+    if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+        local kde_helper="$LIBDIR/qq-kwin-screenshot-helper" kde_desktop="" d
+        for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share} /usr/share; do
+            if [[ -r "$d/applications/qq-kwin-screenshot-helper.desktop" ]]; then
+                kde_desktop="$d/applications/qq-kwin-screenshot-helper.desktop"
+                break
+            fi
+        done
+        if [[ ! -x "$kde_helper" ]]; then
+            note "截图：缺 $kde_helper（KDE 下截图会是黑图，重装本包）"
+        elif [[ -z "$kde_desktop" ]]; then
+            note "截图：找不到 qq-kwin-screenshot-helper.desktop，KWin 的权限检查会拒绝 ScreenShot2（重装本包）"
+        elif ! grep -q '^X-KDE-DBUS-Restricted-Interfaces=org\.kde\.KWin\.ScreenShot2$' "$kde_desktop"; then
+            note "截图：$kde_desktop 的受限接口声明格式不对（不能带结尾分号），KWin 会拒绝 ScreenShot2"
+        elif command -v busctl >/dev/null 2>&1 && ! busctl --user status org.kde.KWin.ScreenShot2 >/dev/null 2>&1; then
+            note "截图：找不到 org.kde.KWin.ScreenShot2 服务（KWin 版本过旧？）"
+        else
+            pass "截图：KDE ScreenShot2（helper + 权限声明）已就绪"
+        fi
     fi
     # Easy Effects 的排除名单在 [StreamInputs] / [StreamOutputs] 的 blocklist=（逗号分隔）。
     # 提到 TRAE 但键不是 blocklist 的行（如 exclude=）Easy Effects 不读，单独指出来，免得用户以为配过了。
@@ -272,6 +319,7 @@ fi
 
 preload=""
 for lib in "$SCREENSHARE_LIB" "$CLIPBOARD_LIB" "$SCREENSHOT_LIB" "$BORDERFIX_LIB"; do
+    [[ "$lib" == "$CLIPBOARD_LIB" ]] && clipboard_auto_disabled && continue
     [[ -r "$lib" ]] && preload="${preload:+$preload:}$lib"
 done
 export LD_PRELOAD="$preload${LD_PRELOAD:+:$LD_PRELOAD}"
@@ -290,5 +338,5 @@ case "$(angle_mode)" in
 esac
 
 keep_crash_records
-{ echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $* angle=$(angle_mode)"; } >"$LOG" 2>/dev/null || LOG=/dev/null
+{ echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $* angle=$(angle_mode) clipboard=$(clipboard_state)"; } >"$LOG" 2>/dev/null || LOG=/dev/null
 exec "$QQ" --ozone-platform=wayland "${angle_arg[@]}" "$@" >>"$LOG" 2>&1

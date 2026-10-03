@@ -11,16 +11,22 @@
  *   1. 在 Wayland 会话里（有 WAYLAND_DISPLAY），通过 wlr-screencopy 逐个截取 Wayland 输出，
  *      按 X 的显示器布局（XRandR monitors，名字与 wl_output 名字对应）拼成根窗口坐标系下的画面。
  *      XShmGetImage 在 rootless XWayland 上不报错、只给全黑，所以不能「X 失败了再截」；
- *   2. 不在 Wayland 会话里，或合成器不支持 wlr-screencopy（KDE、GNOME）时，照常调用 Xlib，
- *      但临时接管 X 错误（默认处理会直接退出进程）；仍然失败就给一张黑图，至少不闪退。
- *      真正的 X11 会话里截取会成功，行为不变。
+ *   2. KDE（KWin）没有 wlr-screencopy：fork/exec 安装的 qq-kwin-screenshot-helper，
+ *      由它调 org.kde.KWin.ScreenShot2.CaptureWorkspace（helper 自己的 .desktop
+ *      声明了受限接口，能通过 KWin 的权限检查），原始像素经管道传回后按显示器裁剪；
+ *   3. 其它情况（GNOME 等）照常调用 Xlib，但临时接管 X 错误（默认处理会直接退出进程）；
+ *      仍然失败就给一张黑图，至少不闪退。真正的 X11 会话里截取会成功，行为不变。
  *
- * QQ_SCREENSHOT_FIX_DISABLE=1 可以关掉。
+ * QQ_SCREENSHOT_FIX_DISABLE=1 关掉整个截图修复；
+ * QQ_SCREENSHOT_KDE=0 只关 KDE 路径，=1 强制走 KDE（测试用）；
+ * QQ_SCREENSHOT_KDE_HELPER 覆盖 helper 路径（测试用）。
  */
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -37,6 +44,11 @@
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 
 #define LOG(...) do { fprintf(stderr, "[qq-screenshot] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+
+/* KDE 截图 helper 的默认安装路径（make 按 LIBEXECDIR 覆盖）。 */
+#ifndef QQ_KDE_HELPER
+#define QQ_KDE_HELPER "/usr/lib/linuxqq-wayland-fix/qq-kwin-screenshot-helper"
+#endif
 
 /* ---------------- 截取 Wayland 输出 ---------------- */
 
@@ -379,7 +391,7 @@ static int niri_focused_output(char *name, size_t name_size)
  * XRandR 显示器。返回名字和 X 逻辑尺寸。
  */
 static int pick_monitor(Display *dpy, const char *want, char *name, size_t name_size,
-                        int *mw, int *mh)
+                        int *mx, int *my, int *mw, int *mh)
 {
     Window root = DefaultRootWindow(dpy);
     int rx = 0, ry = 0;
@@ -407,6 +419,8 @@ static int pick_monitor(Display *dpy, const char *want, char *name, size_t name_
                           ry >= m[i].y && ry < m[i].y + m[i].height);
         if (hit) {
             snprintf(name, name_size, "%s", nm);
+            *mx = m[i].x;
+            *my = m[i].y;
             *mw = m[i].width;
             *mh = m[i].height;
             found = 1;
@@ -423,13 +437,218 @@ static int pick_monitor(Display *dpy, const char *want, char *name, size_t name_
 }
 
 /* 优先 niri 聚焦输出；不是 niri 或查询失败时按指针位置。 */
-static int target_monitor(Display *dpy, char *name, size_t name_size, int *mw, int *mh)
+static int target_monitor(Display *dpy, char *name, size_t name_size,
+                          int *mx, int *my, int *mw, int *mh)
 {
     char niri[64];
     if (niri_focused_output(niri, sizeof niri) &&
-        pick_monitor(dpy, niri, name, name_size, mw, mh))
+        pick_monitor(dpy, niri, name, name_size, mx, my, mw, mh))
         return 1;
-    return pick_monitor(dpy, NULL, name, name_size, mw, mh);
+    return pick_monitor(dpy, NULL, name, name_size, mx, my, mw, mh);
+}
+
+/* ---------------- KDE（KWin ScreenShot2）---------------- */
+
+struct kwin_shot_header {
+    char magic[4]; /* "QQKS" */
+    uint32_t width, height, stride, format; /* QImage::Format */
+    double scale;
+};
+
+/* 0=自动（KDE 会话才用），1=强制（测试用），-1=禁用 */
+static int kde_mode(void)
+{
+    static int mode = -2;
+    if (mode != -2)
+        return mode;
+    const char *v = getenv("QQ_SCREENSHOT_KDE");
+    if (v && *v) {
+        mode = !strcmp(v, "0") ? -1 : 1;
+        return mode;
+    }
+    const char *de = getenv("XDG_CURRENT_DESKTOP");
+    const char *kde = getenv("KDE_FULL_SESSION");
+    mode = ((de && strstr(de, "KDE")) || (kde && *kde)) ? 1 : 0;
+    return mode;
+}
+
+static const char *kde_helper_path(void)
+{
+    const char *p = getenv("QQ_SCREENSHOT_KDE_HELPER");
+    return (p && *p) ? p : QQ_KDE_HELPER;
+}
+
+static int kde_usable(void)
+{
+    return kde_mode() == 1 && access(kde_helper_path(), X_OK) == 0;
+}
+
+/* 去掉子进程环境里的注入变量，避免 helper 里再加载一遍我们的库。 */
+static void strip_env(const char *name)
+{
+    extern char **environ;
+    size_t len = strlen(name);
+    for (char **p = environ; *p;) {
+        if (!strncmp(*p, name, len) && (*p)[len] == '=') {
+            for (char **q = p; *q; q++)
+                *q = q[1];
+        } else {
+            p++;
+        }
+    }
+}
+
+static int read_all(int fd, void *buf, size_t len)
+{
+    char *p = buf;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/*
+ * 调 helper 截整张工作区（KWin ScreenShot2.CaptureWorkspace，原始像素）。
+ * 成功返回 0x00RRGGBB 的缓冲，失败返回 NULL（调用方退回黑图）。
+ */
+static uint32_t *kde_workspace_image(int *w, int *h)
+{
+    const char *helper = kde_helper_path();
+    int fds[2];
+    if (pipe(fds) != 0)
+        return NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        if (fds[1] != STDOUT_FILENO)
+            close(fds[1]);
+        strip_env("LD_PRELOAD");
+        strip_env("LD_LIBRARY_PATH");
+        execl(helper, helper, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+
+    struct kwin_shot_header hdr;
+    uint8_t *raw = NULL;
+    uint32_t *pix = NULL;
+    if (read_all(fds[0], &hdr, sizeof hdr) != 0 || memcmp(hdr.magic, "QQKS", 4) != 0 ||
+        !hdr.width || !hdr.height || !hdr.stride) {
+        LOG("KDE: ScreenShot2 helper failed (权限未生效或 KWin 版本不支持？)");
+        goto out;
+    }
+
+    size_t total = (size_t)hdr.stride * hdr.height;
+    raw = malloc(total);
+    if (!raw || read_all(fds[0], raw, total) != 0) {
+        LOG("KDE: short image from helper");
+        goto out;
+    }
+
+    pix = malloc((size_t)hdr.width * hdr.height * 4);
+    if (!pix)
+        goto out;
+    switch (hdr.format) {
+    case 4: case 5: case 6: /* RGB32 / ARGB32 / ARGB32_Premultiplied：内存里就是 B,G,R,A */
+        for (uint32_t y = 0; y < hdr.height; y++) {
+            const uint32_t *s = (const uint32_t *)(raw + (size_t)y * hdr.stride);
+            uint32_t *d = pix + (size_t)y * hdr.width;
+            for (uint32_t x = 0; x < hdr.width; x++)
+                d[x] = s[x] & 0x00ffffffu;
+        }
+        break;
+    case 16: case 17: case 18: /* RGBX8888 / RGBA8888[_Premultiplied]：字节序 R,G,B,A */
+        for (uint32_t y = 0; y < hdr.height; y++) {
+            const uint8_t *s = raw + (size_t)y * hdr.stride;
+            uint32_t *d = pix + (size_t)y * hdr.width;
+            for (uint32_t x = 0; x < hdr.width; x++, s += 4)
+                d[x] = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2];
+        }
+        break;
+    default:
+        LOG("KDE: unsupported QImage format %u", hdr.format);
+        free(pix);
+        pix = NULL;
+        goto out;
+    }
+    *w = (int)hdr.width;
+    *h = (int)hdr.height;
+    LOG("KDE: captured workspace %ux%u via ScreenShot2 (QImage format %u, scale %.2f)",
+        hdr.width, hdr.height, hdr.format, hdr.scale);
+
+out:
+    free(raw);
+    close(fds[0]);
+    waitpid(pid, NULL, 0);
+    return pix;
+}
+
+/* 把 src 里 (sx,sy,sw,sh) 缩放着铺进 dst（最近邻，和 blit 一致）。 */
+static void blit_rect(uint32_t *dst, int dw, int dh,
+                      const uint32_t *src, int src_w, int src_h,
+                      int sx, int sy, int sw, int sh)
+{
+    for (int y = 0; y < dh; y++) {
+        int syy = sy + (int)((long)y * sh / dh);
+        if (syy < 0 || syy >= src_h)
+            continue;
+        const uint32_t *srow = src + (size_t)syy * src_w;
+        uint32_t *drow = dst + (size_t)y * dw;
+        for (int x = 0; x < dw; x++) {
+            int sxx = sx + (int)((long)x * sw / dw);
+            if (sxx >= 0 && sxx < src_w)
+                drow[x] = srow[sxx];
+        }
+    }
+}
+
+/*
+ * KDE 单屏：工作区整图按 X 根窗口/显示器矩形的比例裁剪并缩放到请求尺寸。
+ * X11 根窗口原点与 KWin 工作区包围盒原点一致，按尺寸比例映射即可。
+ */
+static uint32_t *kde_monitor_image(Display *dpy, int mx, int my, int mw, int mh, int w, int h)
+{
+    int kw = 0, kh = 0;
+    uint32_t *kpix = kde_workspace_image(&kw, &kh);
+    if (!kpix)
+        return NULL;
+
+    Window r;
+    int rx, ry;
+    unsigned rw = 0, rh = 0, bw, depth;
+    if (!XGetGeometry(dpy, DefaultRootWindow(dpy), &r, &rx, &ry, &rw, &rh, &bw, &depth) || !rw || !rh) {
+        free(kpix);
+        return NULL;
+    }
+
+    uint32_t *pix = calloc((size_t)w * h, 4);
+    if (pix) {
+        int ix = (int)((long)mx * kw / (long)rw);
+        int iy = (int)((long)my * kh / (long)rh);
+        int iw = (int)((long)mw * kw / (long)rw);
+        int ih = (int)((long)mh * kh / (long)rh);
+        LOG("KDE: crop monitor (%d,%d %dx%d) -> image (%d,%d %dx%d) -> %dx%d",
+            mx, my, mw, mh, ix, iy, iw, ih, w, h);
+        blit_rect(pix, w, h, kpix, kw, kh, ix, iy, iw, ih);
+    }
+    free(kpix);
+    return pix;
 }
 
 /* 单屏模式：只截指针所在显示器，按请求的尺寸缩放。 */
@@ -441,7 +660,8 @@ static struct {
     struct timespec at;
 } mon_cache;
 
-static uint32_t *monitor_image(Display *dpy, const char *name, int w, int h)
+static uint32_t *monitor_image(Display *dpy, const char *name,
+                               int mx, int my, int mw, int mh, int w, int h)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -454,21 +674,39 @@ static uint32_t *monitor_image(Display *dpy, const char *name, int w, int h)
     free(mon_cache.pix);
     mon_cache.pix = NULL;
 
-    struct capture c;
-    if (capture_all(&c)) {
-        capture_free(&c);
-        return NULL;
-    }
-    uint32_t *pix = calloc((size_t)w * h, 4);
-    if (pix) {
-        for (struct output *o = c.outputs; o; o = o->next)
-            if (o->pix && !strcmp(o->name, name)) {
-                LOG("single-monitor: %s %dx%d -> requested %dx%d", name, o->w, o->h, w, h);
-                blit(pix, w, h, 0, 0, w, h, o);
-                break;
+    uint32_t *pix = NULL;
+    int kde_first = kde_usable(); /* KDE 会话（或测试强制）时优先 ScreenShot2 */
+
+    if (kde_first)
+        pix = kde_monitor_image(dpy, mx, my, mw, mh, w, h);
+
+    if (!pix) {
+        struct capture c;
+        if (capture_all(&c) == 0) {
+            pix = calloc((size_t)w * h, 4);
+            if (pix) {
+                int found = 0;
+                for (struct output *o = c.outputs; o; o = o->next)
+                    if (o->pix && !strcmp(o->name, name)) {
+                        LOG("single-monitor: %s %dx%d -> requested %dx%d", name, o->w, o->h, w, h);
+                        blit(pix, w, h, 0, 0, w, h, o);
+                        found = 1;
+                        break;
+                    }
+                if (!found) {
+                    free(pix);
+                    pix = NULL;
+                }
             }
+            capture_free(&c);
+        }
     }
-    capture_free(&c);
+
+    if (!pix && !kde_first && kde_usable())
+        pix = kde_monitor_image(dpy, mx, my, mw, mh, w, h);
+
+    if (!pix)
+        pix = calloc((size_t)w * h, 4); /* 截不到：给全黑，行为与以前一致 */
 
     mon_cache.dpy = dpy;
     snprintf(mon_cache.name, sizeof mon_cache.name, "%s", name);
@@ -498,43 +736,55 @@ static uint32_t *root_image(Display *dpy, Window root, int *w, int *h)
     if (!XGetGeometry(dpy, root, &r, &rx, &ry, &rw, &rh, &bw, &depth))
         return NULL;
 
+    uint32_t *pix = NULL;
     struct capture c;
-    if (capture_all(&c)) {
+    if (capture_all(&c) == 0) {
+        pix = calloc((size_t)rw * rh, 4);
+        if (pix) {
+            void *xrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
+            get_monitors_fn get = xrandr ? (get_monitors_fn)dlsym(xrandr, "XRRGetMonitors") : NULL;
+            free_monitors_fn freem = xrandr ? (free_monitors_fn)dlsym(xrandr, "XRRFreeMonitors") : NULL;
+            int n = 0, placed = 0;
+            MonitorInfo *m = get ? get(dpy, root, True, &n) : NULL;
+            for (int i = 0; i < n; i++) {
+                char *name = XGetAtomName(dpy, m[i].name);
+                for (struct output *o = c.outputs; o && name; o = o->next)
+                    if (o->pix && !strcmp(o->name, name)) {
+                        blit(pix, rw, rh, m[i].x, m[i].y, m[i].width, m[i].height, o);
+                        placed++;
+                        break;
+                    }
+                XFree(name);
+            }
+            if (m && freem)
+                freem(m);
+            /* 不 dlclose，原因见 pick_monitor。 */
+            if (!placed) /* 对不上名字时：铺满第一块屏 */
+                for (struct output *o = c.outputs; o; o = o->next)
+                    if (o->pix) {
+                        blit(pix, rw, rh, 0, 0, rw, rh, o);
+                        break;
+                    }
+            LOG("captured %ux%u root from Wayland (%d monitor(s) matched)", rw, rh, placed);
+        }
         capture_free(&c);
-        return NULL;
-    }
-    uint32_t *pix = calloc((size_t)rw * rh, 4);
-    if (!pix) {
-        capture_free(&c);
-        return NULL;
     }
 
-    void *xrandr = dlopen("libXrandr.so.2", RTLD_LAZY | RTLD_LOCAL);
-    get_monitors_fn get = xrandr ? (get_monitors_fn)dlsym(xrandr, "XRRGetMonitors") : NULL;
-    free_monitors_fn freem = xrandr ? (free_monitors_fn)dlsym(xrandr, "XRRFreeMonitors") : NULL;
-    int n = 0, placed = 0;
-    MonitorInfo *m = get ? get(dpy, root, True, &n) : NULL;
-    for (int i = 0; i < n; i++) {
-        char *name = XGetAtomName(dpy, m[i].name);
-        for (struct output *o = c.outputs; o && name; o = o->next)
-            if (o->pix && !strcmp(o->name, name)) {
-                blit(pix, rw, rh, m[i].x, m[i].y, m[i].width, m[i].height, o);
-                placed++;
-                break;
-            }
-        XFree(name);
+    if (!pix && kde_usable()) {
+        int kw = 0, kh = 0;
+        uint32_t *kpix = kde_workspace_image(&kw, &kh);
+        if (kpix) {
+            pix = calloc((size_t)rw * rh, 4);
+            if (pix)
+                blit_rect(pix, (int)rw, (int)rh, kpix, kw, kh, 0, 0, kw, kh);
+            free(kpix);
+            if (pix)
+                LOG("captured %ux%u root via KDE ScreenShot2", rw, rh);
+        }
     }
-    if (m && freem)
-        freem(m);
-    /* 不 dlclose，原因见 pick_monitor。 */
-    if (!placed) /* 对不上名字时：铺满第一块屏 */
-        for (struct output *o = c.outputs; o; o = o->next)
-            if (o->pix) {
-                blit(pix, rw, rh, 0, 0, rw, rh, o);
-                break;
-            }
-    LOG("captured %ux%u root from Wayland (%d monitor(s) matched)", rw, rh, placed);
-    capture_free(&c);
+
+    if (!pix)
+        return NULL;
 
     root_cache.dpy = dpy;
     root_cache.pix = pix;
@@ -554,10 +804,11 @@ static int fill_from_wayland(Display *dpy, Window root, XImage *img, int x, int 
     char name[64];
     int mw = 0, mh = 0;
 
+    int mx = 0, my = 0;
     if (getenv("WAYLAND_DISPLAY") && img->format == ZPixmap && img->bits_per_pixel == 32) {
-        if (target_monitor(dpy, name, sizeof name, &mw, &mh)) {
+        if (target_monitor(dpy, name, sizeof name, &mx, &my, &mw, &mh)) {
             /* 单屏模式：QQ 看到的屏幕就是目标显示器（优先 niri 聚焦输出） */
-            pix = monitor_image(dpy, name, img->width, img->height);
+            pix = monitor_image(dpy, name, mx, my, mw, mh, img->width, img->height);
             rw = img->width;
             rh = img->height;
         } else {
@@ -690,8 +941,8 @@ int XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *attr)
     int r = real(dpy, w, attr);
     if (r && enabled() && getenv("WAYLAND_DISPLAY") && is_root(dpy, w)) {
         char name[64];
-        int mw, mh;
-        if (target_monitor(dpy, name, sizeof name, &mw, &mh)) {
+        int mx, my, mw, mh;
+        if (target_monitor(dpy, name, sizeof name, &mx, &my, &mw, &mh)) {
             LOG("single-monitor: report screen as %s %dx%d", name, mw, mh);
             attr->width = mw;
             attr->height = mh;

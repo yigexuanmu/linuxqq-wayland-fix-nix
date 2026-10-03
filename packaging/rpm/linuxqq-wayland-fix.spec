@@ -42,6 +42,7 @@ Open "QQ（Wayland修复版）" from the application menu.
 %{_bindir}/linuxqq-wayland-fix
 %{_libdir}/%{srcname}/
 %{_datadir}/applications/linuxqq-wayland-fix.desktop
+%{_datadir}/applications/qq-kwin-screenshot-helper.desktop
 
 %changelog
 * Thu Oct 01 2026 Shorin <shorin@example.com> - %{version}-1

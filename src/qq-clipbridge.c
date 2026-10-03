@@ -1200,12 +1200,22 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 __attribute__((constructor))
 static void init(void)
 {
-    /* QQ_CLIPBOARD_FIX_DISABLE=1：不启用（排查问题用）；QQ_CLIPBOARD_FIX_FORCE=1：任意进程都启用（仅供测试） */
+    /* QQ_CLIPBOARD_FIX_DISABLE=1：不启用（排查问题用）；
+     * QQ_CLIPBOARD_FIX_FORCE=1：强制启用（任意进程 / KDE 上绕过自动禁用，仅供测试）。 */
     const char *off = getenv("QQ_CLIPBOARD_FIX_DISABLE");
     if ((off && *off && strcmp(off, "0")) || !getenv("WAYLAND_DISPLAY") || !getenv("DISPLAY"))
         return;
-    if (!getenv("QQ_CLIPBOARD_FIX_FORCE") && !is_qq_main_on_wayland())
-        return;
+    if (!getenv("QQ_CLIPBOARD_FIX_FORCE")) {
+        /* KDE Plasma 自己会把 XWayland 的剪贴板与 Wayland 双向同步（KWin/Klipper），
+         * QQ 的 X11 剪贴板本来就能互通；再叠一层本修复会互相抢所有权、来回循环，
+         * 实测会让 QQ 崩溃，所以 KDE 默认不启用。 */
+        const char *de = getenv("XDG_CURRENT_DESKTOP");
+        const char *kde = getenv("KDE_FULL_SESSION");
+        if ((de && strstr(de, "KDE")) || (kde && *kde))
+            return;
+        if (!is_qq_main_on_wayland())
+            return;
+    }
     /* 后台线程会开自己的 X 连接，与 QQ 的 Xlib 调用并发；必须在任何 Xlib 调用之前初始化线程支持。 */
     XInitThreads();
     if (pipe2(wake_pipe, O_CLOEXEC | O_NONBLOCK) < 0)

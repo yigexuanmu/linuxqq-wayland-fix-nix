@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=linuxqq-wayland-fix KWin screenshot helper
+Comment=Helper that lets QQ use KWin's ScreenShot2 interface (KDE only)
+Exec=@LIBEXECDIR@/qq-kwin-screenshot-helper
+NoDisplay=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
